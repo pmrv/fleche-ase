@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fleche-ase"
+version = "0.1.0"
+description = "ASE bindings to fleche"
+authors = [{name = "Marvin Poul", email = "pmrv@posteo.de"}]
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+dependencies = [
+    'ase >=3, <4',
+    'fleche',
+]
+
+[project.entry-points.'fleche']
+digest = 'fleche_ase:digest_hooks'
