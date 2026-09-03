@@ -15,5 +15,8 @@ dependencies = [
     'fleche',
 ]
 
+[project.optional-dependencies]
+test = ['pytest']
+
 [project.entry-points.'fleche']
 digest = 'fleche_ase:digest_hooks'
