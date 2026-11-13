@@ -1,3 +1,6 @@
+import os
+import time
+
 import numpy as np
 import pytest
 from ase import Atoms
@@ -13,7 +16,10 @@ from ase.thermochemistry import (
     RRHOMode,
 )
 from ase.vibrations import VibrationsData
-from fleche.digest import digest
+from ase.calculators.calculator import Calculator
+from fleche.digest import Indigestible, digest
+
+import fleche_ase
 
 VIB_ENERGIES = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09]
 
@@ -144,3 +150,241 @@ def test_mode_digest_differs_between_classes():
     harmonic = HarmonicMode(0.01)
     rrho = RRHOMode(0.01, mean_inertia=1.0)
     assert digest(harmonic) != digest(rrho)
+
+
+# --------------------------------------------------------------------------- constraints
+
+def test_atoms_digest_sees_constraints(water):
+    """(cell, pbc, arrays) says nothing about what is held fixed, and a relaxation of a
+    constrained structure is not the same calculation as one of a free structure."""
+    from ase.constraints import FixAtoms
+
+    fixed = water.copy()
+    fixed.set_constraint(FixAtoms(indices=[0]))
+    other = water.copy()
+    other.set_constraint(FixAtoms(indices=[1]))
+
+    assert digest(fixed) != digest(water)
+    assert digest(fixed) != digest(other)
+    assert digest(fixed) == digest(fixed.copy())
+
+
+def test_atoms_digest_sees_info(water):
+    tagged = water.copy()
+    tagged.info["solute"] = "Mg"
+    assert digest(tagged) != digest(water)
+
+
+def test_unconstrained_atoms_keep_the_previous_key(water):
+    """An Atoms with nothing extra must digest as it did before constraints were folded in,
+    so installing this version over an existing cache does not invalidate it."""
+    previous = digest((
+        "Atoms" if type(water) is Atoms else str(type(water)),
+        digest(water.cell),
+        digest(water.pbc),
+        digest(water.arrays),
+    ))
+    assert fleche_ase.atoms_digest(water) == previous
+
+
+# --------------------------------------------------------------------------- file identity
+
+def test_fingerprint_follows_content(tmp_path):
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights-v1")
+    first = fleche_ase.file_fingerprint(p)
+    assert fleche_ase.file_fingerprint(p) == first
+
+    p.write_bytes(b"weights-v2")
+    assert fleche_ase.file_fingerprint(p) != first, \
+        "a model re-exported in place must change its fingerprint"
+
+
+def test_rapid_same_size_rewrites_each_get_their_own_fingerprint(tmp_path):
+    """The memo must not outlive a rewrite the filesystem clock cannot resolve.
+
+    The memo key is (path, size, mtime_ns), and mtime granularity is coarse -- a millisecond
+    on ext4, up to a second on some NFS mounts -- so a same-size rewrite inside one tick
+    leaves the key unchanged. Before `_memoise` learned git's racily-clean rule this returned
+    a STALE hash, which is the one thing a content fingerprint must never do. It showed up as
+    a flaky `test_fingerprint_follows_content`; twenty rewrites in a row make it reliable.
+    """
+    p = tmp_path / "model.npz"
+    seen = []
+    for i in range(20):
+        p.write_bytes(f"weights-v{i:02d}".encode())    # same length every time
+        seen.append(fleche_ase.file_fingerprint(p))
+    assert len(set(seen)) == len(seen), "a rewrite was masked by the memo"
+
+
+def test_a_settled_file_is_still_memoised(tmp_path):
+    """The racily-clean rule must not turn the memo off; a big model is hashed once."""
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights")
+    os.utime(p, (time.time() - 3600, time.time() - 3600))
+    st = p.stat()
+    key = (str(p.resolve()), st.st_size, st.st_mtime_ns)
+    fleche_ase._FINGERPRINTS.pop(key, None)
+    fleche_ase.file_fingerprint(p)
+    assert key in fleche_ase._FINGERPRINTS
+
+
+def test_fingerprint_of_a_directory_covers_names_and_bytes(tmp_path):
+    d = tmp_path / "saved_model"
+    (d / "variables").mkdir(parents=True)
+    (d / "saved_model.pb").write_bytes(b"graph")
+    (d / "variables" / "v.index").write_bytes(b"idx")
+    first = fleche_ase.file_fingerprint(d)
+
+    (d / "variables" / "v.index").write_bytes(b"idx2")
+    assert fleche_ase.file_fingerprint(d) != first
+
+    (d / "variables" / "v.index").write_bytes(b"idx")
+    (d / "variables" / "renamed.index").write_bytes(b"idx")
+    assert fleche_ase.file_fingerprint(d) != first, "a file under a new name must show"
+
+
+def test_fingerprint_refuses_what_it_cannot_read(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        fleche_ase.file_fingerprint(tmp_path / "gone.npz")
+    d = tmp_path / "many"
+    d.mkdir()
+    for i in range(5):
+        (d / str(i)).write_bytes(b"x")
+    with pytest.raises(ValueError, match="max_files"):
+        fleche_ase.file_fingerprint(d, max_files=4)
+
+
+# --------------------------------------------------------------------------- calculators
+
+class _ModelCalculator(Calculator):
+    """Stands in for a calculator whose whole identity is a model file."""
+
+    implemented_properties = ["energy"]
+
+    def __init__(self, path, **kwargs):
+        super().__init__(**kwargs)
+        self.path = path
+
+    def calculate(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def test_a_parameter_free_calculator_still_digests():
+    from ase.calculators.emt import EMT
+
+    assert EMT().todict() == {}, "the premise"
+    assert digest(EMT()) == digest(EMT())
+
+
+def test_a_model_calculator_without_an_identity_is_refused(tmp_path):
+    """The defect this change exists for: todict() is {} and every model would share a key."""
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights")
+    calc = _ModelCalculator(p)
+
+    assert calc.todict() == {}
+    with pytest.raises(Indigestible, match="identify"):
+        digest(calc)
+
+
+def test_identify_distinguishes_two_models(tmp_path):
+    a, b = tmp_path / "a.npz", tmp_path / "b.npz"
+    a.write_bytes(b"weights-a")
+    b.write_bytes(b"weights-b")
+
+    ca = fleche_ase.identify(_ModelCalculator(a), model="one", path=a)
+    cb = fleche_ase.identify(_ModelCalculator(b), model="two", path=b)
+    assert digest(ca) != digest(cb)
+    assert digest(fleche_ase.identify(_ModelCalculator(a), model="one", path=a)) == digest(ca)
+
+
+def test_identify_is_content_addressed(tmp_path):
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights-v1")
+    before = digest(fleche_ase.identify(_ModelCalculator(p), model="m", path=p))
+    p.write_bytes(b"weights-v2")
+    assert digest(fleche_ase.identify(_ModelCalculator(p), model="m", path=p)) != before
+
+
+def test_registered_extractor_is_used(tmp_path):
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights")
+    fleche_ase.register("_ModelCalculator",
+                        lambda c: {"sha256": fleche_ase.file_fingerprint(c.path)})
+    try:
+        # `before` must be captured: digest() is not memoised on the object, so recomputing it
+        # after the rewrite would read the new bytes and compare them with themselves.
+        before = digest(_ModelCalculator(p))
+        assert digest(_ModelCalculator(p)) == before
+        p.write_bytes(b"other")
+        assert digest(_ModelCalculator(p)) != before
+    finally:
+        fleche_ase._EXTRACTORS.pop("_ModelCalculator", None)
+
+
+def test_a_class_can_be_declared_parameter_free(tmp_path):
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights")
+    fleche_ase.register("_ModelCalculator", None)
+    try:
+        assert digest(_ModelCalculator(p)) == digest(_ModelCalculator(p))
+    finally:
+        fleche_ase.PARAMETER_FREE.discard("_ModelCalculator")
+
+
+# --- the built-in pyace extractor, exercised without pyace installed -------------------
+#
+# The extractors are keyed by class NAME precisely so this module imports no ML stack, which
+# also means a stand-in of the right name reaches the real code path.
+
+
+class PyACECalculator(Calculator):
+    """Stand-in for `pyace.asecalc.PyACECalculator`, with its `todict()`.
+
+    The real one hands `basis_set` to `ase.calculators.calculator.Calculator.__init__`, which
+    files it in `self.parameters`; `todict()` returns those parameters. The C++ evaluator the
+    constructor builds from it is not on the object's `todict()` at all.
+    """
+
+    implemented_properties = ["energy"]
+
+    def __init__(self, basis_set, **kw):
+        super().__init__()
+        self._params = {"basis_set": basis_set, "recursive": False,
+                        "fast_nl": True, "verbose": 0, **kw}
+
+    def todict(self):
+        return dict(self._params)
+
+
+def test_pyace_is_identified_by_the_contents_of_its_basis_file(tmp_path):
+    p = tmp_path / "potential.yaml"
+    p.write_bytes(b"species: Au\ncoefficients: [1, 2, 3]\n")
+    before = digest(PyACECalculator(str(p)))
+    assert digest(PyACECalculator(str(p))) == before
+    p.write_bytes(b"species: Au\ncoefficients: [1, 2, 4]\n")
+    assert digest(PyACECalculator(str(p))) != before, \
+        "refitting a potential in place must not read back the old run"
+
+
+def test_pyace_parameters_that_change_the_numbers_change_the_key(tmp_path):
+    p = tmp_path / "potential.yaml"
+    p.write_bytes(b"species: Au\n")
+    assert digest(PyACECalculator(str(p))) != digest(PyACECalculator(str(p), recursive=True))
+
+
+def test_pyace_with_a_parsed_basis_object_is_refused(tmp_path):
+    """A caller who built a `BBasisConfiguration` itself has to say what it is.
+
+    The object identifies nothing that survives the process, and guessing would put every
+    such calculator on one cache key.
+    """
+    class _Basis:
+        pass
+
+    calc = PyACECalculator(_Basis())
+    with pytest.raises(Indigestible):
+        digest(calc)
+    fleche_ase.identify(calc, potential="AuPt-1000f")
+    assert digest(calc) == digest(calc)
