@@ -50,6 +50,7 @@ every value is stale. :func:`file_fingerprint` hashes the bytes, memoised per pr
 
 import hashlib
 import os
+import time
 from pathlib import Path
 
 from ase import Atoms
@@ -85,6 +86,33 @@ def _hash_file(path, m):
             m.update(chunk)
 
 
+_RACE_WINDOW_NS = 2_000_000_000
+"""How fresh an mtime has to be before it is treated as untrustworthy; see :func:`_memoise`."""
+
+
+def _memoise(key, mtime_ns: int, compute) -> str:
+    """``compute()``, remembered under *key* unless the file was touched a moment ago.
+
+    *key* carries the file's size and mtime, so a rewrite normally changes it. Filesystem
+    mtime granularity is coarse, though -- a millisecond on ext4, and as much as a second on
+    some NFS mounts -- so a SAME-SIZE rewrite inside one tick leaves the key unchanged and the
+    memo hands back the OLD hash. That is precisely the failure this module exists to prevent:
+    a model re-exported in place silently reading back the previous run's results.
+
+    The rule is git's, adopted for the same reason it keeps "racily clean" index entries: a
+    file whose mtime is within a tick of now cannot be told apart from one that is about to be
+    written again, so its hash is computed and not remembered. The window closes by itself as
+    the clock moves on, costing at most a rehash per call for a second or two after a write.
+    """
+    hit = _FINGERPRINTS.get(key)
+    if hit is not None:
+        return hit
+    value = compute()
+    if time.time_ns() - mtime_ns > _RACE_WINDOW_NS:
+        _FINGERPRINTS[key] = value
+    return value
+
+
 def file_fingerprint(path, max_files: int = 20000) -> str:
     """SHA-256 of a file's bytes, or of a directory's (relative path, bytes) listing.
 
@@ -101,28 +129,31 @@ def file_fingerprint(path, max_files: int = 20000) -> str:
 
     if p.is_file():
         st = p.stat()
-        key = (str(p), st.st_size, st.st_mtime_ns)
-        if key not in _FINGERPRINTS:
+
+        def one():
             m = hashlib.sha256()
             _hash_file(p, m)
-            _FINGERPRINTS[key] = m.hexdigest()
-        return _FINGERPRINTS[key]
+            return m.hexdigest()
+
+        return _memoise((str(p), st.st_size, st.st_mtime_ns), st.st_mtime_ns, one)
 
     files = sorted(f for f in p.rglob("*") if f.is_file())
     if len(files) > max_files:
         raise ValueError(f"cannot fingerprint {p}: {len(files)} files exceeds "
                          f"max_files={max_files}")
     stats = [f.stat() for f in files]
-    key = (str(p), len(files), sum(s.st_size for s in stats),
-           max((s.st_mtime_ns for s in stats), default=0))
-    if key not in _FINGERPRINTS:
+    newest = max((s.st_mtime_ns for s in stats), default=0)
+
+    def tree():
         m = hashlib.sha256()
         for f in files:
             m.update(str(f.relative_to(p)).encode())
             m.update(b"\0")
             _hash_file(f, m)
-        _FINGERPRINTS[key] = m.hexdigest()
-    return _FINGERPRINTS[key]
+        return m.hexdigest()
+
+    return _memoise((str(p), len(files), sum(s.st_size for s in stats), newest),
+                    newest, tree)
 
 
 def register(class_name: str, extractor=None) -> None:
@@ -167,11 +198,24 @@ def _grace_runtime(calc):
 
 
 def _pyace(calc):
-    for attr in ("basis_set", "potential_file", "filename"):
-        val = getattr(calc, attr, None)
-        if isinstance(val, (str, os.PathLike)) and Path(val).exists():
-            return {"potential": str(Path(val).resolve()), "sha256": file_fingerprint(val)}
-    raise _indigestible(calc, "pyace keeps a parsed basis, not the file it came from")
+    """pyace parses the basis at construction, but ase keeps the constructor argument.
+
+    `PyACECalculator.__init__` forwards `basis_set` into `Calculator.__init__`, which files it
+    in `calc.parameters` and so into `todict()`. It is there either as the path it was handed
+    or as a basis object the caller built itself; the path is content-addressed, and the
+    object is refused, because it identifies nothing that survives the process. The rest of
+    `todict()` rides along -- `recursive`, `fast_nl` and the gamma bounds change the numbers.
+    """
+    try:
+        params = dict(calc.todict())
+    except Exception as e:                                             # noqa: BLE001
+        raise _indigestible(calc, f"todict() raised {type(e).__name__}: {e}") from None
+    basis = params.pop("basis_set", None)
+    if isinstance(basis, (str, os.PathLike)) and Path(basis).exists():
+        return {"potential": str(Path(basis).resolve()),
+                "sha256": file_fingerprint(basis), **params}
+    raise _indigestible(
+        calc, "its basis_set is a parsed basis object, not a file this process can hash")
 
 
 # Known model-backed calculators, keyed by class NAME so that importing this module pulls in

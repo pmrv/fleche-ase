@@ -1,3 +1,6 @@
+import os
+import time
+
 import numpy as np
 import pytest
 from ase import Atoms
@@ -197,6 +200,35 @@ def test_fingerprint_follows_content(tmp_path):
         "a model re-exported in place must change its fingerprint"
 
 
+def test_rapid_same_size_rewrites_each_get_their_own_fingerprint(tmp_path):
+    """The memo must not outlive a rewrite the filesystem clock cannot resolve.
+
+    The memo key is (path, size, mtime_ns), and mtime granularity is coarse -- a millisecond
+    on ext4, up to a second on some NFS mounts -- so a same-size rewrite inside one tick
+    leaves the key unchanged. Before `_memoise` learned git's racily-clean rule this returned
+    a STALE hash, which is the one thing a content fingerprint must never do. It showed up as
+    a flaky `test_fingerprint_follows_content`; twenty rewrites in a row make it reliable.
+    """
+    p = tmp_path / "model.npz"
+    seen = []
+    for i in range(20):
+        p.write_bytes(f"weights-v{i:02d}".encode())    # same length every time
+        seen.append(fleche_ase.file_fingerprint(p))
+    assert len(set(seen)) == len(seen), "a rewrite was masked by the memo"
+
+
+def test_a_settled_file_is_still_memoised(tmp_path):
+    """The racily-clean rule must not turn the memo off; a big model is hashed once."""
+    p = tmp_path / "model.npz"
+    p.write_bytes(b"weights")
+    os.utime(p, (time.time() - 3600, time.time() - 3600))
+    st = p.stat()
+    key = (str(p.resolve()), st.st_size, st.st_mtime_ns)
+    fleche_ase._FINGERPRINTS.pop(key, None)
+    fleche_ase.file_fingerprint(p)
+    assert key in fleche_ase._FINGERPRINTS
+
+
 def test_fingerprint_of_a_directory_covers_names_and_bytes(tmp_path):
     d = tmp_path / "saved_model"
     (d / "variables").mkdir(parents=True)
@@ -299,3 +331,60 @@ def test_a_class_can_be_declared_parameter_free(tmp_path):
         assert digest(_ModelCalculator(p)) == digest(_ModelCalculator(p))
     finally:
         fleche_ase.PARAMETER_FREE.discard("_ModelCalculator")
+
+
+# --- the built-in pyace extractor, exercised without pyace installed -------------------
+#
+# The extractors are keyed by class NAME precisely so this module imports no ML stack, which
+# also means a stand-in of the right name reaches the real code path.
+
+
+class PyACECalculator(Calculator):
+    """Stand-in for `pyace.asecalc.PyACECalculator`, with its `todict()`.
+
+    The real one hands `basis_set` to `ase.calculators.calculator.Calculator.__init__`, which
+    files it in `self.parameters`; `todict()` returns those parameters. The C++ evaluator the
+    constructor builds from it is not on the object's `todict()` at all.
+    """
+
+    implemented_properties = ["energy"]
+
+    def __init__(self, basis_set, **kw):
+        super().__init__()
+        self._params = {"basis_set": basis_set, "recursive": False,
+                        "fast_nl": True, "verbose": 0, **kw}
+
+    def todict(self):
+        return dict(self._params)
+
+
+def test_pyace_is_identified_by_the_contents_of_its_basis_file(tmp_path):
+    p = tmp_path / "potential.yaml"
+    p.write_bytes(b"species: Au\ncoefficients: [1, 2, 3]\n")
+    before = digest(PyACECalculator(str(p)))
+    assert digest(PyACECalculator(str(p))) == before
+    p.write_bytes(b"species: Au\ncoefficients: [1, 2, 4]\n")
+    assert digest(PyACECalculator(str(p))) != before, \
+        "refitting a potential in place must not read back the old run"
+
+
+def test_pyace_parameters_that_change_the_numbers_change_the_key(tmp_path):
+    p = tmp_path / "potential.yaml"
+    p.write_bytes(b"species: Au\n")
+    assert digest(PyACECalculator(str(p))) != digest(PyACECalculator(str(p), recursive=True))
+
+
+def test_pyace_with_a_parsed_basis_object_is_refused(tmp_path):
+    """A caller who built a `BBasisConfiguration` itself has to say what it is.
+
+    The object identifies nothing that survives the process, and guessing would put every
+    such calculator on one cache key.
+    """
+    class _Basis:
+        pass
+
+    calc = PyACECalculator(_Basis())
+    with pytest.raises(Indigestible):
+        digest(calc)
+    fleche_ase.identify(calc, potential="AuPt-1000f")
+    assert digest(calc) == digest(calc)
